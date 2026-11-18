@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+wandb/
+mlruns/
+
+# Builds and native artifacts
+build/
+dist/
+cmake-build-*/
+out/
+target/
+*.o
+*.obj
+*.pdb
+*.exe
+*.dll
+*.so
+*.a
+*.lib
+*.out
+*.sln
+*.vcxproj
+*.vcxproj.*
+
+# Training runs, logs, and model artifacts
+runs/
+*.log
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tfevents.*
+
+# Generated reports and profiling data
+coverage.xml
+*.prof
+*.tmp
+*.bak
+*.swp
+
+# Editors and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~
