@@ -19,11 +19,11 @@ import math
 import numpy as np
 import torch
 
-from . import scenarios
+from . import neighbours, scenarios
 from .config import (
     CTRL_SIGNAL, CTRL_STOP, CTRL_YIELD, EGO_FEATURES, LANE_FEATURES, LAT_KEEP, LAT_LEFT,
     LAT_RIGHT, LON_DELTAS, LON_NEUTRAL, MOV_LEFT, MOV_THROUGH, CTRL_TO_CAT, NUM_CAT, NUM_LAT, NUM_MOV,
-    NUM_SCENARIOS, OBS_DIM, REL_LANES, REWARD_DT, EnvConfig, RewardConfig,
+    NUM_SCENARIOS, OBS_DIM, REL_LANES, REWARD_DT, EnvConfig, RewardConfig, dist_feature,
 )
 
 INF = 1e6
@@ -104,6 +104,7 @@ class LaneChangeEnv:
         self.lane_from, self.lane_to, self.prog = i(E, N), i(E, N), f(E, N)
         self.mov, self.age = i(E, N), i(E, N)
         self.aggr, self.info, self.vdes, self.t_ff = f(E, N), f(E, N), f(E, N), f(E, N)
+        self.vlen = f(E, N) + cfg.veh_len   # vehicle length: car veh_len, truck truck_len
         # per-vehicle accumulators flushed into per-env stats on termination
         self.acc_lc, self.acc_abort, self.acc_hb, self.acc_unsafe = f(E, N), f(E, N), f(E, N), f(E, N)
         self.acc_jerk = f(E, N)
@@ -177,7 +178,21 @@ class LaneChangeEnv:
         return torch.where(self.prog >= 0.5, self.lane_to, self.lane_from)
 
     def _tables(self):
-        """Leader / follower / density tables for every vehicle and every lane: [E, N, K]."""
+        """Leader / follower / density tables for every vehicle and every lane: [E, N, K].
+        Uses the sorted-list CUDA kernel (lcrl/neighbours.py) when it is available."""
+        if neighbours.enabled():
+            return neighbours.freeway_tables(self, INF)
+        return self._tables_dense()
+
+    def _bumper_gaps(self, lead_dx, lead_idx, lag_dx):
+        """Front-to-front distances -> bumper-to-bumper gaps: minus the leader's length ahead,
+        minus the ego's own length behind. [E, N, K]."""
+        len_lead = torch.gather(self.vlen[:, :, None].expand(-1, -1, lead_idx.shape[-1]), 1, lead_idx)
+        return (torch.where(lead_dx < INF / 2, lead_dx - len_lead, INF),
+                torch.where(lag_dx < INF / 2, lag_dx - self.vlen[..., None], INF))
+
+    def _tables_dense(self):
+        """Reference neighbour search: every vehicle against every vehicle, [E, N, N, K]."""
         cfg = self.cfg
         occ = self._occupancy()
         dx = self.x[:, None, :] - self.x[:, :, None]           # [E, i, j] = x_j - x_i
@@ -188,9 +203,8 @@ class LaneChangeEnv:
         lag_c = torch.where((~ahead)[..., None] & occ_j & (self.slot[:, None] != self.slot[None, :])[None, ..., None],
                             -dx[..., None], INF)
         lag_dx, lag_idx = lag_c.min(dim=2)
-        T = {"occ": occ, "lead_idx": lead_idx, "lag_idx": lag_idx,
-             "lead_gap": torch.where(lead_dx < INF, lead_dx - cfg.veh_len, INF),
-             "lag_gap": torch.where(lag_dx < INF, lag_dx - cfg.veh_len, INF)}
+        T = {"occ": occ, "lead_idx": lead_idx, "lag_idx": lag_idx}
+        T["lead_gap"], T["lag_gap"] = self._bumper_gaps(lead_dx, lead_idx, lag_dx)
         # density / queue ahead within the vehicle's information range
         rng_i = self.info[:, :, None, None]
         within = ahead[..., None] & occ_j & (dx[..., None] < rng_i)
@@ -270,8 +284,8 @@ class LaneChangeEnv:
 
         lim = self.limit[:, None]
         ego = [self.v / lim, self.vdes / lim, self.aggr, self.info / Rn, self.prog, lc_dir.float(),
-               need.clamp(-3, 3) / 3.0, (deadline / 300.0).clamp(0, 1),
-               ((self.seg_len[:, None] - self.x) / 600.0).clamp(0, 1)]
+               need.clamp(-3, 3) / 3.0, dist_feature(deadline),
+               dist_feature(self.seg_len[:, None] - self.x)]
         cat = self.k_ctrl_to_cat[self.ctrl][:, None]
         ego += [(cat == k).float().expand(-1, self.N) for k in range(NUM_CAT)]
         # rank / 2: a single-segment stop line is either closed (0) or open with priority (1)
@@ -292,8 +306,8 @@ class LaneChangeEnv:
             has_lead, has_lag = lead_gap < self.info, lag_gap < self.info
             cnt = g(T["count"], kc)
             fl = [ex.float(),
-                  ((le - self.x) / 300.0).clamp(0, 1) * valid,
-                  ((ls - self.x) / 300.0).clamp(0, 1) * valid * (ls < INF),
+                  dist_feature(le - self.x) * valid,
+                  dist_feature(ls - self.x) * valid * (ls < INF),
                   (g(ok, kc) & valid).float(),
                   torch.where(valid, g(lanes_to_ok, kc).abs().clamp(max=3) / 3.0, 1.0),
                   torch.where(has_lead, lead_gap, self.info).clamp(-5, Rn) / Rn,
@@ -376,7 +390,7 @@ class LaneChangeEnv:
         # each other in the tables: only the one further ahead may go
         dx = self.x[:, None, :] - self.x[:, :, None]                        # [E, i, j]: j ahead of i
         v_i, v_j = self.v[:, :, None], self.v[:, None, :]
-        need = cfg.veh_len + cfg.s0 + (v_i ** 2 - v_j ** 2).clamp(min=0) / (2 * cfg.b_lc_safe) + v_i * dt
+        need = self.vlen[:, None, :] + cfg.s0 + (v_i ** 2 - v_j ** 2).clamp(min=0) / (2 * cfg.b_lc_safe) + v_i * dt
         clash = start[:, :, None] & start[:, None, :] & (new_to[:, :, None] == new_to[:, None, :]) \
             & (dx > -1e-3) & (dx < need) & (self.slot[:, None] != self.slot[None, :])
         start = start & ~clash.any(-1)
@@ -504,6 +518,7 @@ class LaneChangeEnv:
         qcost = torch.gather(T["queue_cost"], 2, c0[..., None]).squeeze(-1)
         r -= rc.blocking * rate * polite * rc.efficiency * qcost * unconstrained
         r -= rate * (rc.unsafe_ttc * unsafe + rc.hard_brake * hard)
+        r -= rate * self._prep_cost(C["need"], C["deadline"])
         r += rc.success * success + rc.missed_route * missed + rc.timeout * timeout + rc.collision * collided
         # a missed movement costs a detour, priced at the driver's own lost-time rate
         r = r - rc.efficiency * (0.5 + aggr) * (rc.detour_s / REWARD_DT) * missed
@@ -541,12 +556,20 @@ class LaneChangeEnv:
     def _headway(self):
         return self.cfg.T * (1.3 - 0.6 * self.aggr)
 
+    def _prep_cost(self, need, deadline):
+        """Per 0.5 s: within the driver's preparation distance H of its deadline, a vehicle
+        outside its route lanes pays prep_cost per lane still to go. H shrinks with
+        aggressiveness, so cautious drivers move to their route lanes earlier."""
+        rc = self.rcfg
+        H = rc.prep_far - self.aggr * (rc.prep_far - rc.prep_near)
+        return rc.prep_cost * need.abs().clamp(max=3).float() * (deadline < H)
+
     def _collisions(self):
         occ = self._occupancy().float()
         shared = torch.einsum("enk,emk->enm", occ, occ) > 0
         dx = self.x[:, None, :] - self.x[:, :, None]
         ahead = ahead_of(self.x, self.slot)
-        return (shared & ahead & (dx < self.cfg.veh_len - 0.5)).any(-1)
+        return (shared & ahead & (dx < self.vlen[:, None, :] - 0.5)).any(-1)   # j ahead of i, j's length
 
     # ------------------------------------------------------------------- demand
     def _spawn(self):
@@ -561,17 +584,21 @@ class LaneChangeEnv:
         ahead = xo >= xs[:, None, :]
         d_ahead, lead = torch.where(ahead, xo - xs[:, None, :], INF).min(1)       # [E,K]
         v_lead = torch.gather(self.v, 1, lead)
+        len_lead = torch.gather(self.vlen, 1, lead)
+        r = lambda: torch.rand(E, K, device=d, generator=self.gen)
+        truck = r() < cfg.truck_share                                             # the entering vehicle
+        vlen = torch.where(truck, cfg.truck_len, cfg.veh_len)
         lim = self.limit[:, None]
         v0 = torch.where(xs > 0, 0.7 * lim, 0.9 * lim)
         # enter no faster than allows a comfortable stop behind the vehicle ahead
-        room = (d_ahead - cfg.veh_len - cfg.s0 - v0 * cfg.dt).clamp(min=0)
+        room = (d_ahead - len_lead - cfg.s0 - v0 * cfg.dt).clamp(min=0)
         v0 = torch.where(d_ahead < INF / 2, torch.minimum(v0, torch.sqrt(v_lead ** 2 + 2 * cfg.b_comf * room)), v0)
-        clear = (d_ahead >= INF / 2) | (d_ahead - cfg.veh_len - cfg.s0 >= (0.8 * v0).clamp(min=2.0))
+        clear = (d_ahead >= INF / 2) | (d_ahead - len_lead - cfg.s0 >= (0.8 * v0).clamp(min=2.0))
         # vehicles that moved into a mid-segment lane (ramp) just behind the entry point
         behind = (xo < xs[:, None, :]) & (xo < INF / 2)
         d_behind = torch.where(behind, xs[:, None, :] - xo, INF)
         v_b = torch.where(behind, self.v[..., None], 0.0)
-        need_b = cfg.veh_len + cfg.s0 + (v_b ** 2 - v0[:, None, :] ** 2).clamp(min=0) / (2 * cfg.b_comf) + v_b * cfg.dt
+        need_b = vlen[:, None, :] + cfg.s0 + (v_b ** 2 - v0[:, None, :] ** 2).clamp(min=0) / (2 * cfg.b_comf) + v_b * cfg.dt
         clear &= ~(d_behind < need_b).any(1)
         go = (self.pending > 0) & clear
         free = ~self.active
@@ -583,11 +610,9 @@ class LaneChangeEnv:
         free_sorted = torch.argsort((~free).to(torch.int8), dim=1, stable=True)  # free slots first
         slot = torch.where(go, torch.gather(free_sorted, 1, rank.clamp(min=0)), N)   # [E,K]; N = none
         # attributes drawn for every lane (dense), written only where a vehicle enters
-        r = lambda: torch.rand(E, K, device=d, generator=self.gen)
         aggr = r() if self.fixed_aggr is None else torch.full((E, K), self.fixed_aggr, device=d)
         lo, hi = cfg.info_range
         info = lo + (hi - lo) * r() if self.fixed_info is None else torch.full((E, K), self.fixed_info, device=d)
-        truck = r() < cfg.truck_share
         vdes = lim * torch.where(truck, 0.55 + 0.2 * r(), (0.9 + 0.2 * r()) * (0.95 + 0.1 * aggr))
         probs = self.mov_prob.reshape(-1, NUM_MOV) + 1e-6 * (torch.arange(NUM_MOV, device=d) == MOV_THROUGH)
         mov = torch.multinomial(probs, 1, generator=self.gen).view(E, K)
@@ -605,6 +630,7 @@ class LaneChangeEnv:
         put("aggr", aggr)
         put("info", info)
         put("vdes", vdes)
+        put("vlen", vlen)
         put("stopped_once", False)
         put("committed", False)
         put("t_ff", (self.seg_len[:, None] - xs) / torch.minimum(vdes, lim))
@@ -614,13 +640,15 @@ class LaneChangeEnv:
     # ---------------------------------------------------------------- baseline
     def rule_action(self, obs, lat_mask):
         """LPSim-style rule baseline: mandatory change toward the route lane as soon as
-        the shield allows; discretionary change when blocked by a slower leader and the
-        adjacent lane offers a longer gap; pure IDM longitudinally."""
+        the shield allows; discretionary change when held up by a close leader (one slower
+        than the ego, or the ego below 80% of its desired speed) and the adjacent lane offers
+        a longer gap; pure IDM longitudinally. Mirrored in LPSim (rl_lpsim.cuh ruleAct)."""
         from .config import obs_index as oi
         need = obs[..., oi("need")]
         lead0, dv0 = obs[..., oi("lead_gap", 0)], obs[..., oi("lead_dv", 0)]
         lat = torch.full(need.shape, LAT_KEEP, dtype=torch.long, device=self.dev)
-        slow = (lead0 < 0.25) & (dv0 < -0.2)
+        held = obs[..., oi("v_rel_limit")] < 0.8 * obs[..., oi("vdes_rel_limit")]
+        slow = (lead0 < 0.25) & ((dv0 < -0.2) | held)
         for d, a in ((-1, LAT_LEFT), (1, LAT_RIGHT)):
             disc = slow & (obs[..., oi("lanes_to_ok", d)] == 0) & (obs[..., oi("exists", d)] > 0) \
                 & (obs[..., oi("lead_gap", d)] > lead0 + 0.1)

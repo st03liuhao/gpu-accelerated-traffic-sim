@@ -13,10 +13,11 @@ import numpy as np
 import torch
 
 from . import intersection as ixd
+from . import neighbours
 from .config import (CAT_AWSC, CAT_FREE, CAT_SIGNAL, CAT_TWSC_MAJOR, CAT_TWSC_MINOR, CAT_YIELD_MINOR,
                      EGO_FEATURES, LANE_FEATURES, LAT_KEEP, LAT_LEFT, LAT_RIGHT, LON_DELTAS, MOV_LEFT,
                      MOV_RIGHT, MOV_THROUGH, NUM_CAT, NUM_LAT, NUM_MOV, REL_LANES, REWARD_DT, IxConfig,
-                     RewardConfig)
+                     RewardConfig, dist_feature)
 from .env import INF, STAT_NAMES, S, ahead_of, decision_step, scatter_slots
 
 KIND_NAMES = list(ixd.KINDS)
@@ -63,6 +64,7 @@ class IntersectionEnv:
         self.x, self.v, self.a_prev = f(E, N), f(E, N), f(E, N)
         self.mov, self.age, self.stop_time = i(E, N), i(E, N), f(E, N)
         self.aggr, self.info, self.vdes, self.t_ff = f(E, N), f(E, N), f(E, N), f(E, N)
+        self.vlen = f(E, N) + cfg.veh_len   # vehicle length: car veh_len, truck truck_len
         self.acc_lc, self.acc_abort, self.acc_hb, self.acc_unsafe, self.acc_jerk = (f(E, N) for _ in range(5))
         self.stats = f(E, len(STAT_NAMES))
         self.slot = torch.arange(N, device=d)
@@ -260,6 +262,48 @@ class IntersectionEnv:
 
     # ------------------------------------------------------------------ neighbour tables
     def _tables(self):
+        """Neighbour tables. Link vehicles use the sorted-list CUDA kernel (lcrl/neighbours.py)
+        when it is available; box leaders come from ``_box_leaders`` either way."""
+        if neighbours.enabled():
+            T = neighbours.ix_tables(self, INF, NLEG)
+            T.update(self._box_leaders())
+            return T
+        return self._tables_dense()
+
+    def _bumper_gaps(self, lead_dx, lead_idx, lag_dx):
+        from .env import LaneChangeEnv
+        return LaneChangeEnv._bumper_gaps(self, lead_dx, lead_idx, lag_dx)
+
+    def _box_leaders(self):
+        """Leaders inside the box: same path ahead, a diverging path still in the shared start,
+        or the exit-lane chain. [E, N, N] (box vehicles are few)."""
+        cfg = self.cfg
+        on_link = self.active & (self.link >= 0)
+        in_box = self.active & (self.link < 0)
+        dx = self.x[:, None, :] - self.x[:, :, None]
+        order = ahead_of(self.x, self.slot)
+        path_c = self.path.clamp(min=0)
+        same_path = in_box[:, :, None] & in_box[:, None, :] & (self.path[:, :, None] == self.path[:, None, :])
+        div = in_box[:, :, None] & in_box[:, None, :] & (self._pair(self.D("c_kind"), self.path, self.path) == ixd.C_DIVERGE)
+        div_out_j = self._pair(self.D("c_out"), self.path, self.path).transpose(1, 2)   # zone end on j's path
+        div = div & (self.x[:, None, :] - self.vlen[:, None, :] < div_out_j)
+        box_ahead = (same_path | div) & order
+        bdx, bidx = torch.where(box_ahead, dx, INF).min(2)
+        p_len = self._g1(self.D("p_len"), path_c)
+        exit_link = NLEG + self._g1(self.D("p_exit"), path_c)
+        exit_lane = self._g1(self.D("p_exit_lane"), path_c)
+        on_exit = on_link[:, None, :] & (self.link[:, None, :] == exit_link[:, :, None]) & \
+            ((self.lane_from[:, None, :] == exit_lane[:, :, None]) | (self.lane_to[:, None, :] == exit_lane[:, :, None]))
+        edx = (p_len - self.x)[:, :, None] + self.x[:, None, :]
+        edx, eidx = torch.where(in_box[:, :, None] & on_exit, edx, INF).min(2)
+        use = edx < bdx
+        idx = torch.where(use, eidx, bidx)
+        return {"box_lead_gap": torch.where(torch.minimum(bdx, edx) < INF / 2,
+                                            torch.minimum(bdx, edx) - torch.gather(self.vlen, 1, idx), INF),
+                "box_lead_idx": idx}
+
+    def _tables_dense(self):
+        """Reference neighbour search: every vehicle against every vehicle, [E, N, N, K]."""
         cfg = self.cfg
         on_link = self.active & (self.link >= 0)
         in_box = self.active & (self.link < 0)
@@ -286,9 +330,8 @@ class IntersectionEnv:
         cdx, cidx = torch.where(match[..., None] & start_k[:, None], chain, INF).min(2)
         use = cdx < lead_dx
         lead_dx, lead_idx = torch.where(use, cdx, lead_dx), torch.where(use, cidx, lead_idx)
-        T = {"occ": occ, "lead_idx": lead_idx, "lag_idx": lag_idx, "link_lead_dx": link_lead_dx,
-             "lead_gap": torch.where(lead_dx < INF / 2, lead_dx - cfg.veh_len, INF),
-             "lag_gap": torch.where(lag_dx < INF / 2, lag_dx - cfg.veh_len, INF)}
+        T = {"occ": occ, "lead_idx": lead_idx, "lag_idx": lag_idx, "link_lead_dx": link_lead_dx}
+        T["lead_gap"], T["lag_gap"] = self._bumper_gaps(lead_dx, lead_idx, lag_dx)
         rng_i = self.info[:, :, None, None]
         within = ahead[..., None] & occ_j & (dx[..., None] < rng_i)
         T["count"] = within.sum(2).float()
@@ -306,23 +349,7 @@ class IntersectionEnv:
         none = best < 0
         T["best_gap"] = torch.where(none, self.info[..., None], best)
         T["best_pos"] = torch.where(none, 0.0, pos)
-        # box leaders: same path ahead, diverging path still in the shared start, exit-lane chain
-        same_path = in_box[:, :, None] & in_box[:, None, :] & (self.path[:, :, None] == self.path[:, None, :])
-        div = in_box[:, :, None] & in_box[:, None, :] & (self._pair(self.D("c_kind"), self.path, self.path) == ixd.C_DIVERGE)
-        div_out_j = self._pair(self.D("c_out"), self.path, self.path).transpose(1, 2)   # zone end on j's path
-        div = div & (self.x[:, None, :] - cfg.veh_len < div_out_j)
-        box_ahead = (same_path | div) & order
-        bdx, bidx = torch.where(box_ahead, dx, INF).min(2)
-        p_len = self._g1(self.D("p_len"), path_c)
-        exit_link = NLEG + self._g1(self.D("p_exit"), path_c)
-        exit_lane = self._g1(self.D("p_exit_lane"), path_c)
-        on_exit = on_link[:, None, :] & (self.link[:, None, :] == exit_link[:, :, None]) & \
-            ((self.lane_from[:, None, :] == exit_lane[:, :, None]) | (self.lane_to[:, None, :] == exit_lane[:, :, None]))
-        edx = (p_len - self.x)[:, :, None] + self.x[:, None, :]
-        edx, eidx = torch.where(in_box[:, :, None] & on_exit, edx, INF).min(2)
-        use = edx < bdx
-        T["box_lead_gap"] = torch.where(torch.minimum(bdx, edx) < INF / 2, torch.minimum(bdx, edx) - cfg.veh_len, INF)
-        T["box_lead_idx"] = torch.where(use, eidx, bidx)
+        T.update(self._box_leaders())
         return T
 
     def _lane_geometry(self):
@@ -374,6 +401,7 @@ class IntersectionEnv:
         intent_tgt = c + intent_dir
         urgency = torch.where(in_lc, 1.0, (1.0 - deadline / 300.0).clamp(0.1, 1.0)) * (intent_dir != 0)
         self._cache = dict(T=T, exists=exists, ok=ok, lanes_to_ok=lanes_to_ok, blocked=blocked, c=c, need=need,
+                           deadline=deadline, on_app=on_app,
                            in_lc=in_lc, lc_dir=lc_dir, plan=plan, rank=rank, sig_state=st, ctl=ctl,
                            grant_ok=grant_ok, stage_ok=stage_ok, release_ok=release_ok, lane_held=lane_held, head=head,
                            ls=ls_v, le=le_v, L_link=L_link)
@@ -392,7 +420,7 @@ class IntersectionEnv:
         lim = self.limit[:, None]
         rank_obs = torch.where(on_app & ~self.granted, rank / 2.0, 1.0)
         ego = [self.v / lim, self.vdes / lim, self.aggr, self.info / Rn, self.prog, lc_dir.float(),
-               need.clamp(-3, 3) / 3.0, (deadline / 300.0).clamp(0, 1), (deadline / 600.0).clamp(0, 1)]
+               need.clamp(-3, 3) / 3.0, dist_feature(deadline), dist_feature(deadline)]
         ego += [(cat == kk).float() for kk in range(NUM_CAT)]
         ego += [rank_obs, blocked.float(), (tts / 60.0).clamp(0, 1), self.stopped_once.float()]
         ego += [(self.mov == m).float() for m in range(NUM_MOV)]
@@ -410,8 +438,8 @@ class IntersectionEnv:
             has_lead, has_lag = lead_gap < self.info, lag_gap < self.info
             cnt = g(T["count"], kc)
             fl = [ex.float(),
-                  ((le - self.x) / 300.0).clamp(0, 1) * valid,
-                  ((ls - self.x) / 300.0).clamp(0, 1) * valid * (ls < INF),
+                  dist_feature(le - self.x) * valid,
+                  dist_feature(ls - self.x) * valid * (ls < INF),
                   (g(ok, kc) & valid).float(),
                   torch.where(valid, g(lanes_to_ok, kc).abs().clamp(max=3) / 3.0, 1.0),
                   torch.where(has_lead, lead_gap, self.info).clamp(-5, Rn) / Rn,
@@ -465,10 +493,10 @@ class IntersectionEnv:
         i_out = self._pair(self.D("c_out"), plan_i, plan)
         j_in = self._pair(self.D("c_in"), plan, plan_i).transpose(1, 2)           # zone on j's path
         j_out = self._pair(self.D("c_out"), plan, plan_i).transpose(1, 2)
-        t_clear = self._t_reach(v_i[:, :, None], i_out - s_i[:, :, None] + cfg.veh_len)
+        t_clear = self._t_reach(v_i[:, :, None], i_out - s_i[:, :, None] + G(self.vlen)[:, :, None])
         h = (1.0 + (1.0 - aggr_i))[:, :, None]
         s_j = s[:, None, :]
-        cleared = s_j - cfg.veh_len > j_out
+        cleared = s_j - self.vlen[:, None, :] > j_out
         inside = (s_j >= j_in) & ~cleared
         v_j = self.v[:, None, :].expand_as(j_in)
         eta_j = self._t_reach(v_j, j_in - s_j)
@@ -519,7 +547,7 @@ class IntersectionEnv:
         same_exit = on_exit[:, None, :] & (el[:, None, :] == b[:, :, None]) & \
             ((self.lane_from[:, None, :] == j[:, :, None]) | (self.lane_to[:, None, :] == j[:, :, None]))
         x_last = torch.where(same_exit, self.x[:, None, :], 1e3).min(-1).values
-        room = x_last - n_head * (cfg.veh_len + cfg.s0) >= cfg.veh_len + cfg.s0
+        room = x_last - n_head * (cfg.veh_len + cfg.s0) >= G(self.vlen) + cfg.s0   # room for its own length
         ok = has & ~ped & room & (plan_i >= 0)
         # a staged vehicle from the same lane waits in the box: the vehicles behind it cannot go
         # (only the next staging place on the same path may be taken)
@@ -616,7 +644,7 @@ class IntersectionEnv:
         new_to = torch.where(start, self.lane_from + want, self.lane_to)
         dxp = self.x[:, None, :] - self.x[:, :, None]
         v_i, v_j = self.v[:, :, None], self.v[:, None, :]
-        need = cfg.veh_len + cfg.s0 + (v_i ** 2 - v_j ** 2).clamp(min=0) / (2 * cfg.b_lc_safe) + v_i * dt
+        need = self.vlen[:, None, :] + cfg.s0 + (v_i ** 2 - v_j ** 2).clamp(min=0) / (2 * cfg.b_lc_safe) + v_i * dt
         clash = start[:, :, None] & start[:, None, :] & (new_to[:, :, None] == new_to[:, None, :]) \
             & (self.link[:, :, None] == self.link[:, None, :]) & (dxp > -1e-3) & (dxp < need) \
             & (self.slot[:, None] != self.slot[None, :])
@@ -755,6 +783,9 @@ class IntersectionEnv:
         gap0 = self._gk(T["lead_gap"], C["c"])
         unconstrained = (gap0 > 15.0 + 1.5 * self.v) & (stop_gap > 15.0) & on_link0
         r = r - rc.blocking * rate * polite * rc.efficiency * self._gk(T["queue_cost"], C["c"]) * unconstrained
+        # preparation distance: outside the route lanes within H of the stop line (as in env.py)
+        H = rc.prep_far - aggr * (rc.prep_far - rc.prep_near)
+        r = r - rate * rc.prep_cost * C["need"].abs().clamp(max=3).float() * (C["deadline"] < H) * C["on_app"]
         r = r + rc.success * success + rc.missed_route * missed + rc.timeout * timeout + rc.collision * collided
         # a missed movement costs a detour, priced at the driver's own lost-time rate
         r = r - rc.efficiency * (0.5 + aggr) * (rc.detour_s / REWARD_DT) * missed
@@ -806,7 +837,7 @@ class IntersectionEnv:
         j_in = i_in.transpose(1, 2)
         j_out = self._pair(self.D("c_out"), path, path).transpose(1, 2)
         s_i, s_j = s[:, :, None], s[:, None, :]
-        cleared_j = s_j - cfg.veh_len > j_out
+        cleared_j = s_j - self.vlen[:, None, :] > j_out
         tol = torch.where(self.staged, 0.0, 0.5)[:, None, :]       # a staged vehicle stops 0.5 m short: not inside
         inside_j = (s_j >= j_in - tol) & ~cleared_j
         before_i = s_i < i_in - 0.5
@@ -857,13 +888,14 @@ class IntersectionEnv:
         shared = (torch.einsum("enk,emk->enm", occ, occ) > 0) & (self.link[:, :, None] == self.link[:, None, :])
         dx = self.x[:, None, :] - self.x[:, :, None]
         ahead = ahead_of(self.x, self.slot)
-        hit = (shared & ahead & (dx < cfg.veh_len - 0.5)).any(-1)
+        lj = self.vlen[:, None, :]                       # length of the vehicle ahead (j)
+        hit = (shared & ahead & (dx < lj - 0.5)).any(-1)
         same_path = in_box[:, :, None] & in_box[:, None, :] & (self.path[:, :, None] == self.path[:, None, :])
-        hit |= (same_path & ahead & (dx < cfg.veh_len - 0.5)).any(-1)
+        hit |= (same_path & ahead & (dx < lj - 0.5)).any(-1)
         kind = self._pair(self.D("c_kind"), self.path, self.path)
         conflict = ((kind == ixd.C_CROSS) | (kind == ixd.C_MERGE)) & in_box[:, :, None] & in_box[:, None, :]
         i_in, i_out = self._pair(self.D("c_in"), self.path, self.path), self._pair(self.D("c_out"), self.path, self.path)
-        inside_i = (self.x[:, :, None] >= i_in + 0.5) & (self.x[:, :, None] - cfg.veh_len <= i_out - 0.5)
+        inside_i = (self.x[:, :, None] >= i_in + 0.5) & (self.x[:, :, None] - self.vlen[:, :, None] <= i_out - 0.5)
         inside_j = inside_i.transpose(1, 2)
         both = conflict & inside_i & inside_j & (self.slot[None, None, :] > self.slot[None, :, None])
         hit |= both.any(-1)
@@ -884,11 +916,12 @@ class IntersectionEnv:
         here = occ[:, :, None, :] & (self.link[:, :, None, None] == legs[None, None, :, None])                   # [E,N,4,K]
         d_ahead, lead = torch.where(here, self.x[:, :, None, None], INF).min(1)                                  # [E,4,K]
         v_lead = torch.gather(self.v, 1, lead.view(E, -1)).view(E, NLEG, K)
+        len_lead = torch.gather(self.vlen, 1, lead.view(E, -1)).view(E, NLEG, K)
         lim = self.limit[:, None, None]
         v0 = (0.9 * lim).expand(E, NLEG, K)
-        room = (d_ahead - cfg.veh_len - cfg.s0 - v0 * cfg.dt).clamp(min=0)
+        room = (d_ahead - len_lead - cfg.s0 - v0 * cfg.dt).clamp(min=0)
         v0 = torch.where(d_ahead < INF / 2, torch.minimum(v0, torch.sqrt(v_lead ** 2 + 2 * cfg.b_comf * room)), v0)
-        clear = (d_ahead >= INF / 2) | (d_ahead - cfg.veh_len - cfg.s0 >= (0.8 * v0).clamp(min=2.0))
+        clear = (d_ahead >= INF / 2) | (d_ahead - len_lead - cfg.s0 >= (0.8 * v0).clamp(min=2.0))
         go = ((self.pending > 0) & clear).view(E, -1)                                                         # [E,4K]
         # hand out free slots in order within each env (fixed shapes, no host sync)
         free = ~self.active
@@ -925,6 +958,7 @@ class IntersectionEnv:
         put("aggr", aggr)
         put("info", info)
         put("vdes", vdes)
+        put("vlen", torch.where(truck, cfg.truck_len, cfg.veh_len))
         put("granted", False)
         put("staged", False)
         put("missed", False)

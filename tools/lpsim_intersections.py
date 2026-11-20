@@ -12,6 +12,10 @@ written by LPSim's tools/generate_network.py --edge-attrs) or as extra edges.csv
   turn_lanes  OSM turn:lanes of the edge's direction, e.g. "left|left;through|through|right"
               -> exact lane use, including dual / triple turn lanes
 (The sidecar keeps edges.csv readable by LPSim's own CSV reader, which splits on every comma.)
+Optional lane spans, edge_lanes.csv (uniqueid, lane, start_m, end_m; generate_network.py
+--lane-spans): an approach lane that starts late is a turn bay, one that ends before the stop
+line serves no movement, turn_lanes applies to the lanes that reach the stop line, and exits use
+only the lanes that exist where the exit edge starts.
 Without them legs are straight (towards the neighbouring node) and lanes are allocated by a
 heuristic (outer lanes take the turns).
 
@@ -67,7 +71,29 @@ def read_network(path):
                 if e is not None:
                     e["geometry"] = parse_wkt(r.get("geometry")) or e["geometry"]
                     e["turn_lanes"] = (r.get("turn_lanes") or "").strip() or e["turn_lanes"]
+    for e in edges:                             # lane spans: (start_m, end_m) per lane, full length by default
+        e["spans"] = [(0.0, e["length"])] * e["lanes"]
+    spans = os.path.join(path, "edge_lanes.csv")
+    if os.path.exists(spans):
+        by_id = {e["id"]: e for e in edges}
+        with open(spans, newline="") as f:
+            for r in csv.DictReader(f):
+                e = by_id.get(int(float(r["uniqueid"])))
+                k = int(r["lane"])
+                if e is not None and 0 <= k < e["lanes"]:
+                    e["spans"][k] = (max(0.0, float(r["start_m"])), min(e["length"], float(r["end_m"])))
     return nodes, edges
+
+
+def stop_line_lanes(e):
+    """Lanes of an approach edge that reach its end (the stop line)."""
+    return [k for k, (s, t) in enumerate(e["spans"]) if t > s and t >= e["length"] - 1.0]
+
+
+def start_lanes(e):
+    """(first lane, count) of the lanes that exist where an exit edge starts."""
+    ks = [k for k, (s, t) in enumerate(e["spans"]) if t > s and s <= 0.5]
+    return (ks[0], ks[-1] - ks[0] + 1) if ks else (0, e["lanes"])
 
 
 def parse_wkt(text):
@@ -189,7 +215,7 @@ def node_design(nodes, n, ins, outs, ctrl_mode, peds, kmax=8, pmax=64):
     spec = []
     for a, lg in enumerate(legs):
         if lg["e_in"] is None:
-            spec.append(dict(angle=lg["angle"], shape=lg["shape"], lanes=[], n_out=lg["e_out"]["lanes"], L_app=0.0,
+            spec.append(dict(angle=lg["angle"], shape=lg["shape"], lanes=[], n_out=start_lanes(lg["e_out"])[1], L_app=0.0,
                              L_exit=lg["e_out"]["length"]))
             continue
         exits = []
@@ -203,17 +229,20 @@ def node_design(nodes, n, ins, outs, ctrl_mode, peds, kmax=8, pmax=64):
         exits.sort(key=lambda e: -e[2])         # sharpest left first
         if not exits:
             spec.append(dict(angle=lg["angle"], shape=lg["shape"], lanes=[],
-                             n_out=lg["e_out"]["lanes"] if lg["e_out"] else 0,
+                             n_out=start_lanes(lg["e_out"])[1] if lg["e_out"] else 0,
                              L_app=0.0, L_exit=lg["e_out"]["length"] if lg["e_out"] else 0.0))
             continue
-        n_lanes = min(lg["e_in"]["lanes"], kmax)
-        alloc = lanes_from_tag(lg["e_in"]["turn_lanes"], n_lanes, exits) if lg["e_in"]["turn_lanes"] else None
+        e_in = lg["e_in"]
+        at_line = [k for k in stop_line_lanes(e_in) if k < kmax]   # movements go to the lanes at the stop line
+        n_lanes = len(at_line)
+        alloc = lanes_from_tag(e_in["turn_lanes"], n_lanes, exits) if e_in["turn_lanes"] else None
         if alloc is None:
             alloc = allocate_lanes(n_lanes, exits)
-        L = lg["e_in"]["length"]
-        lanes = [(0.0, L, sum(1 << b for b in s)) for s in alloc]
+        L = e_in["length"]
+        masks = {k: sum(1 << b for b in s_) for k, s_ in zip(at_line, alloc)}
+        lanes = [(s0, t0, masks.get(k, 0)) for k, (s0, t0) in enumerate(e_in["spans"][:kmax])]
         spec.append(dict(angle=lg["angle"], shape=lg["shape"], lanes=lanes,
-                         n_out=lg["e_out"]["lanes"] if lg["e_out"] else 0,
+                         n_out=start_lanes(lg["e_out"])[1] if lg["e_out"] else 0,
                          L_app=L, L_exit=lg["e_out"]["length"] if lg["e_out"] else 0.0))
     for s in spec:                              # legs without an approach or exit still need geometry
         s["n_out"] = max(s["n_out"], 0)
@@ -279,7 +308,9 @@ def main():
                                  round(float(d["D"][leg]), 3)])
         for i in range(nP):
             a_, b_ = int(d["p_leg"][i]), int(d["p_exit"][i])
-            rows["paths"].append([n, i, a_, int(d["p_lane"][i]), int(d["p_mov"][i]), b_, int(d["p_exit_lane"][i]),
+            e_out = d["legs_meta"][b_]["e_out"]
+            rows["paths"].append([n, i, a_, int(d["p_lane"][i]), int(d["p_mov"][i]), b_,
+                                  int(d["p_exit_lane"][i]) + start_lanes(e_out)[0],
                                   d["legs_meta"][a_]["e_in"]["id"], d["legs_meta"][b_]["e_out"]["id"],
                                   round(float(d["p_len"][i]), 3), round(float(d["s_wait"][i]), 3), int(d["n_stage"][i])])
             for q in range(nP):

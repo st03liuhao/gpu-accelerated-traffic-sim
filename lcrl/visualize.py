@@ -200,7 +200,7 @@ if __name__ == "__main__":
                    help="4-leg signal demand levels in veh/h per leg (start:stop:step or a,b,c); 'none' = one random design")
     a = p.parse_args()
     if a.scenarios in ("all", "freeway", "none"):
-        scen = {"all": list(range(len(SCENARIO_NAMES))), "freeway": [0, 1, 2, 3], "none": []}[a.scenarios]
+        scen = {"all": list(range(len(SCENARIO_NAMES))), "freeway": [0, 1, 2, 3, 8], "none": []}[a.scenarios]
     else:
         scen = [int(s) if s.isdigit() else SCENARIO_NAMES.index(s) for s in a.scenarios.split(",")]
     from .visualize_ix import ix_kind_ids

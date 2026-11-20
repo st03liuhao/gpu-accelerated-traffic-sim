@@ -11,7 +11,7 @@ import numpy as np
 
 from .config import (
     CTRL_FREE, CTRL_SIGNAL, CTRL_STOP, CTRL_YIELD,
-    FWY_LANE_ADD, FWY_LANE_DROP, FWY_OFFRAMP, FWY_ONRAMP,
+    FREEWAY_SCENARIOS, FWY_LANE_ADD, FWY_LANE_DROP, FWY_OFFRAMP, FWY_ONRAMP, FWY_WEAVE,
     MOV_LEFT, MOV_RIGHT, MOV_THROUGH, NUM_MOV,
     SIG_DEDICATED, SIG_SHARED, STOP_SIGN, YIELD_SIGN,
 )
@@ -42,8 +42,14 @@ def generate(scenario, rng, max_lanes=6, demand_scale=1.0):
     """Return a dict describing one randomised segment of the given scenario type."""
     s = _empty(max_lanes)
     s["scenario"] = scenario
-    if scenario <= FWY_LANE_ADD:
-        seg_len, m = 600.0, int(rng.integers(2, 5))
+    if scenario in FREEWAY_SCENARIOS:
+        # segments end at a deadline (off-ramp, lane drop) are up to 2 km long, so that
+        # vehicles learn to prepare from far away; the exit is known from the entry
+        long_ = scenario in (FWY_OFFRAMP, FWY_LANE_DROP)
+        seg_len, m = float(rng.uniform(600.0, 2000.0 if long_ else 1200.0)), int(rng.integers(2, 5))
+        if scenario == FWY_WEAVE:
+            x_on, weave = float(rng.uniform(100.0, 200.0)), float(rng.uniform(300.0, 900.0))
+            seg_len = x_on + weave
         s["seg_len"], s["speed_limit"] = seg_len, float(rng.uniform(25.0, 33.0))
         _main_lanes(s, range(m), seg_len)
         lane_rate = rng.uniform(0.12, 0.45) * demand_scale     # 430-1620 veh/h/lane
@@ -61,6 +67,14 @@ def generate(scenario, rng, max_lanes=6, demand_scale=1.0):
             s["lane_end"][m - 1], s["lane_mov"][m - 1] = seg_len - float(rng.uniform(150.0, 300.0)), 0
         elif scenario == FWY_LANE_ADD:
             s["lane_start"][m], s["lane_end"][m], s["lane_mov"][m] = float(rng.uniform(100.0, 250.0)), seg_len, T
+        elif scenario == FWY_WEAVE:
+            # auxiliary lane from the on-ramp at x_on to the off-ramp at the segment end: ramp
+            # vehicles going on must leave it to the left, exiting mainline vehicles enter it
+            s["lane_start"][m], s["lane_end"][m], s["lane_mov"][m] = x_on, seg_len, R
+            s["spawn_rate"][m] = rng.uniform(0.08, 0.3) * demand_scale
+            exit_share, ramp_to_ramp = float(rng.uniform(0.1, 0.3)), float(rng.uniform(0.1, 0.3))
+            s["mov_prob"][:m] = [0.0, 1.0 - exit_share, exit_share]
+            s["mov_prob"][m] = [0.0, 1.0 - ramp_to_ramp, ramp_to_ramp]
         return s
 
     # urban approaches

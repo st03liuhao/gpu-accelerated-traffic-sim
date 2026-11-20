@@ -20,11 +20,13 @@ import warnings
 
 import torch
 
-# pure functions of the env state: no random numbers, no state writes
+# pure functions of the env state: no random numbers, no state writes. The dense neighbour
+# search (_tables_dense) is compiled only when the sorted-list CUDA kernel
+# (lcrl/neighbours.py) is unavailable; otherwise _tables calls that kernel.
 FUSED = {
-    "LaneChangeEnv": ("_tables", "_collisions", "_lane_geometry", "_lat_mask", "_safe_to_enter", "_signal"),
-    "IntersectionEnv": ("_tables", "_box_walls", "_permission", "_collisions", "_lane_geometry", "_lat_mask",
-                        "_safe_to_enter", "_plan", "_rank", "_control"),
+    "LaneChangeEnv": ("_tables_dense", "_collisions", "_lane_geometry", "_lat_mask", "_safe_to_enter", "_signal"),
+    "IntersectionEnv": ("_tables_dense", "_box_leaders", "_box_walls", "_permission", "_collisions", "_lane_geometry",
+                        "_lat_mask", "_safe_to_enter", "_plan", "_rank", "_control"),
 }
 
 
@@ -49,7 +51,10 @@ def fuse_rules(env):
     for name in ("recompile_limit", "cache_size_limit"):      # one compiled graph per env instance
         if hasattr(dyn, name):
             setattr(dyn, name, max(getattr(dyn, name), 64))
+    from . import neighbours
     for name in FUSED[type(env).__name__]:
+        if name == "_tables_dense" and neighbours.enabled():
+            continue
         setattr(env, name, torch.compile(getattr(env, name), fullgraph=True, dynamic=False))
     env._fused = True
     return True

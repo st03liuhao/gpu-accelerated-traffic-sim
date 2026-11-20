@@ -48,7 +48,7 @@ def metrics_from_stats(st, n_envs, seconds, dt):
 
 @torch.no_grad()
 def run(policy, envs_per_scenario=128, warmup=200, steps=1200, seed=123, fixed_aggr=None,
-        fixed_info=None, device="cuda", scenarios=(0, 1, 2, 3)):
+        fixed_info=None, device="cuda", scenarios=(0, 1, 2, 3, 8)):
     """policy: "rule" or an ActorCritic. Returns {scenario_name: metrics}."""
     scenarios = list(scenarios)
     cfg = EnvConfig(num_envs=envs_per_scenario * len(scenarios), episode_s=(warmup + steps + 10) * EnvConfig.decision_dt)
@@ -128,6 +128,66 @@ def sweep_signal4(policy, levels=SIG4_LEVELS, envs_per_level=32, warmup=600, ste
     per = env.stats.view(len(levels), envs_per_level, -1).sum(1)
     return {int(q): metrics_from_stats(per[i].tolist(), envs_per_level, steps * cfg.decision_dt, cfg.dt)
             for i, q in enumerate(levels)}
+
+
+@torch.no_grad()
+def lc_timing(policy, scenario, aggr_levels=(0.0, 0.5, 1.0), envs=128, warmup=100, steps=700, seed=7, device="cuda"):
+    """Distance to the deadline when route-required lane changes start, per aggressiveness level:
+    {aggr: (n, p10, p50, p90)} in metres. Every driver gets the same aggressiveness."""
+    import numpy as np
+    out = {}
+    for ag in aggr_levels:
+        cfg = EnvConfig(num_envs=envs, episode_s=(warmup + steps + 10) * EnvConfig.decision_dt)
+        env = LaneChangeEnv(cfg, device=device, seed=seed, fixed_aggr=ag)
+        env.reset(scenario_ids=torch.full((envs,), scenario))
+        dists = []
+        for t in range(warmup + steps):
+            obs, mask, _ = env.observe()
+            c = env._cache
+            need, deadline, in_lc = c["need"].clone(), c["deadline"].clone(), c["in_lc"].clone()
+            if policy == "rule":
+                lat, lon = env.rule_action(obs, mask)
+            else:
+                lat, lon, _ = policy.act(obs, mask, deterministic=True)
+            env.step(lat, lon)
+            if t >= warmup:
+                started = env.active & ~in_lc & (env.lane_from != env.lane_to)
+                route = started & (need != 0) & ((env.lane_to - env.lane_from).sign() == need.sign())
+                dists.append(deadline[route])
+        d = torch.cat(dists).cpu().numpy()
+        out[ag] = (len(d), *np.percentile(d, [10, 50, 90]).tolist()) if len(d) else (0, float("nan"), float("nan"), float("nan"))
+    return out
+
+
+@torch.no_grad()
+def route_share(policy, scenario, aggr_levels=(0.0, 0.5, 1.0), bins=(0, 100, 200, 500, 1000, 2000), envs=128,
+                warmup=100, steps=700, seed=7, device="cuda", tol=0):
+    """Share of exiting vehicles (movement = right / exit) already in a route lane, by distance to
+    the deadline: {aggr: [share per bin]}. ``tol``: lanes still to go that count as there. Every driver gets the same aggressiveness."""
+    from .config import MOV_RIGHT
+    out = {}
+    edges = torch.tensor(bins, dtype=torch.float32, device=device)
+    for ag in aggr_levels:
+        cfg = EnvConfig(num_envs=envs, episode_s=(warmup + steps + 10) * EnvConfig.decision_dt)
+        env = LaneChangeEnv(cfg, device=device, seed=seed, fixed_aggr=ag)
+        env.reset(scenario_ids=torch.full((envs,), scenario))
+        inside = torch.zeros(len(bins) - 1, device=device)
+        total = torch.zeros(len(bins) - 1, device=device)
+        for t in range(warmup + steps):
+            obs, mask, _ = env.observe()
+            if t >= warmup:
+                c = env._cache
+                sel = env.active & (env.mov == MOV_RIGHT)
+                b = torch.bucketize(c["deadline"][sel], edges[1:-1])
+                total += torch.bincount(b, minlength=len(bins) - 1).float()
+                inside += torch.bincount(b[c["need"][sel].abs() <= tol], minlength=len(bins) - 1).float()
+            if policy == "rule":
+                lat, lon = env.rule_action(obs, mask)
+            else:
+                lat, lon, _ = policy.act(obs, mask, deterministic=True)
+            env.step(lat, lon)
+        out[ag] = (inside / total.clamp(min=1)).tolist()
+    return out
 
 
 def run_all(policy, envs=128, steps=1200, **kw):

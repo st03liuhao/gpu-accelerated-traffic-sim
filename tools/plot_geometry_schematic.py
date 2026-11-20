@@ -1,4 +1,4 @@
-"""Schematic of the intersection geometry data structure (docs/DESIGN.md section 10).
+"""Schematic of the intersection geometry data structure (docs/DESIGN.md section 7.2).
 
     python tools/plot_geometry_schematic.py [--out docs/img/geometry_data_structure.png]
 

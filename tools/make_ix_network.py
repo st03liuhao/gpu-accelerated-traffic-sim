@@ -6,7 +6,9 @@ Creates nodes.csv / edges.csv / od_demand.csv (LPSim format) for a single 4-leg 
 intersection: every leg has a feeder link (vehicles spawn there) and a 200 m approach / exit
 link pair. ``--curve`` bends every leg (edge_attrs.csv gets a WKT ``geometry``), ``--skew`` rotates legs
 away from the compass points, and ``--turn-lanes`` sets an OSM turn:lanes value on every
-approach (its lane count overrides ``--lanes`` for approaches). Demand is Poisson per approach with left / through / right shares, then
+approach (its lane count overrides ``--lanes`` for approaches). ``--left-bay M`` adds a
+left-turn bay of M m on every approach: lane 0 of the approach link starts M m before the stop
+line (edge_lanes.csv), and lane_links.csv connects the feeder's lanes to the through lanes. Demand is Poisson per approach with left / through / right shares, then
 tools/lpsim_intersections.py adds the ix_*.csv design tables.
 """
 import argparse
@@ -36,7 +38,10 @@ def main():
     p.add_argument("--curve", type=float, default=0.0, help="each leg bends by this many degrees (alternating sign)")
     p.add_argument("--skew", type=float, default=0.0, help="leg i is rotated by +-skew degrees")
     p.add_argument("--turn-lanes", default="", help='OSM turn:lanes for every approach, e.g. "left|left|through|through;right"')
+    p.add_argument("--left-bay", type=float, default=0.0, help="left-turn bay length (m) on every approach")
     a = p.parse_args()
+    if a.left_bay > 0 and not a.turn_lanes:
+        a.turn_lanes = "|".join(["left"] + ["through"] * (a.lanes - 1) + ["through;right"])
     os.makedirs(a.out, exist_ok=True)
     lon0, lat0 = -122.4, 37.77
     m_per_deg_lat, m_per_deg_lon = 111_320.0, 111_320.0 * math.cos(math.radians(lat0))
@@ -64,7 +69,8 @@ def main():
             nodes.append((idx, *to_ll(px, py), ""))
             store[i] = idx
         geo_out, geo_in = (wkt(pts), wkt(pts[::-1])) if a.curve else ("", "")
-        for u, v, length, lanes, geo, tl in ((feed[i], mid[i], 100.0, n_app, "", a.turn_lanes and ""),
+        n_feed = a.lanes if a.left_bay > 0 else n_app
+        for u, v, length, lanes, geo, tl in ((feed[i], mid[i], 100.0, n_feed, "", a.turn_lanes and ""),
                                              (mid[i], 0, a.approach, n_app, geo_in, a.turn_lanes),
                                              (0, mid[i], a.approach, a.lanes, geo_out, ""),
                                              (mid[i], feed[i], 100.0, a.lanes, "", "")):
@@ -83,6 +89,24 @@ def main():
         w = csv.writer(f)
         w.writerow(["uniqueid", "geometry", "turn_lanes"])
         w.writerows((e[0], e[6], e[7]) for e in edges if e[6] or e[7])
+    for name in ("edge_lanes.csv", "lane_links.csv"):
+        if os.path.exists(os.path.join(a.out, name)):
+            os.remove(os.path.join(a.out, name))
+    if a.left_bay > 0:     # bay: lane 0 of each approach starts left_bay m before the stop line
+        with open(os.path.join(a.out, "edge_lanes.csv"), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["uniqueid", "lane", "start_m", "end_m"])
+            for e in edges:
+                if e[2] == 0:
+                    for k in range(e[4]):
+                        w.writerow([e[0], k, round(max(e[3] - a.left_bay, 0.0), 3) if k == 0 else 0, e[3]])
+        with open(os.path.join(a.out, "lane_links.csv"), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["in_edge", "out_edge", "shift"])
+            for e in edges:
+                if e[1] in feed.values():
+                    nxt = next(x for x in edges if x[1] == e[2] and x[2] == 0)
+                    w.writerow([e[0], nxt[0], 1])
     # demand: Poisson arrivals per approach, movement by turning direction
     rng = random.Random(a.seed)
     shares = [float(x) for x in a.shares.split(",")]

@@ -6,14 +6,17 @@ Conventions follow LPSim (src/simulator/cuda_traffic_sim.cu):
   * physics step ``dt`` = 0.1 s; the policy decides every ``decision_dt`` = 0.5 s (the env
     runs ``substeps`` physics steps per decision, all on the GPU).
 """
+import math
 from dataclasses import dataclass, field
 
 # ---- scenarios -------------------------------------------------------------
 FWY_ONRAMP, FWY_OFFRAMP, FWY_LANE_DROP, FWY_LANE_ADD = 0, 1, 2, 3
 SIG_DEDICATED, SIG_SHARED, STOP_SIGN, YIELD_SIGN = 4, 5, 6, 7
+FWY_WEAVE = 8          # on-ramp joined to the next off-ramp by an auxiliary lane
+FREEWAY_SCENARIOS = (FWY_ONRAMP, FWY_OFFRAMP, FWY_LANE_DROP, FWY_LANE_ADD, FWY_WEAVE)
 SCENARIO_NAMES = [
     "freeway_onramp", "freeway_offramp", "freeway_lane_drop", "freeway_lane_add",
-    "signal_dedicated_turn", "signal_shared_turn", "stop_sign", "yield_sign",
+    "signal_dedicated_turn", "signal_shared_turn", "stop_sign", "yield_sign", "freeway_weave",
 ]
 NUM_SCENARIOS = len(SCENARIO_NAMES)
 
@@ -58,6 +61,16 @@ LANE_FEATURES = [
 REL_LANES = (-1, 0, 1)   # left, current, right
 OBS_DIM = len(EGO_FEATURES) + len(REL_LANES) * len(LANE_FEATURES)
 
+# Distances to a deadline, a lane end or a lane start enter the observation on a log scale:
+# metre-level detail near the deadline, still distinct up to DIST_MAX_M (2 km).
+DIST_SCALE_M, DIST_MAX_M = 50.0, 2000.0
+_DIST_NORM = math.log1p(DIST_MAX_M / DIST_SCALE_M)
+
+
+def dist_feature(d):
+    """log(1 + d / 50) / log(1 + 2000 / 50), clipped to [0, 1]. d: tensor of metres."""
+    return ((d.clamp(min=0.0) / DIST_SCALE_M).log1p() / _DIST_NORM).clamp(max=1.0)
+
 
 def obs_index(name, rel_lane=None):
     """Index of a named feature in the flat observation vector."""
@@ -70,11 +83,12 @@ def obs_index(name, rel_lane=None):
 @dataclass
 class EnvConfig:
     num_envs: int = 1024          # parallel road segments
-    max_veh: int = 64             # vehicle slots per segment
+    max_veh: int = 160            # vehicle slots per segment (segments up to 2 km)
     max_lanes: int = 6
     dt: float = 0.1               # physics step (s)
     decision_dt: float = 0.5      # policy / rule decision interval (s); a multiple of dt
-    veh_len: float = 5.0
+    veh_len: float = 5.0          # car length (m); positions are front bumpers, gaps are bumper to bumper
+    truck_len: float = 12.0       # truck length (m)
     s0: float = 1.38              # IDM jam distance (LPSim default)
     T: float = 1.2                # IDM time headway (scaled by aggressiveness)
     a_max: float = 1.5            # IDM max acceleration
@@ -82,14 +96,14 @@ class EnvConfig:
     b_max: float = 6.0            # physical braking capability used by the shield
     b_lc_safe: float = 4.0        # max decel a lane change may force on anyone
     lc_duration: float = 3.0      # seconds for a full lateral move
-    max_age_s: float = 200.0      # vehicle timeout (deadlock guard)
-    episode_s: float = 300.0      # env re-generated after this long
+    max_age_s: float = 400.0      # vehicle timeout (deadlock guard)
+    episode_s: float = 500.0      # env re-generated after this long
     obs_norm_range: float = 200.0 # normaliser for distances
     demand_scale: float = 1.0
-    truck_share: float = 0.12     # slow vehicles that trigger bypass manoeuvres
+    truck_share: float = 0.12     # slow, long vehicles (truck_len) that trigger bypass manoeuvres
     # freeway scenarios only: the single-leg intersection scenarios (4-7) are superseded by
     # the full intersections in lcrl/ix_env.py but remain available for comparison
-    scenarios: tuple = (FWY_ONRAMP, FWY_OFFRAMP, FWY_LANE_DROP, FWY_LANE_ADD)
+    scenarios: tuple = FREEWAY_SCENARIOS
     # info level (gap search range) and aggressiveness sampled per vehicle
     info_range: tuple = (50.0, 200.0)
     aggr_range: tuple = (0.0, 1.0)
@@ -143,6 +157,11 @@ class RewardConfig:
     violation: float = -1.0       # crossing the stop line on red / without stopping / without yielding
     blocking: float = 1.0         # x lost-time rate of the queue a vehicle holds up while the road ahead is free
     team_share: float = 0.5       # cooperative share, multiplied by politeness = 1 - aggr
+    # preparation distance H = prep_far - aggr * (prep_far - prep_near): within H of its
+    # deadline, a vehicle outside its route lanes pays prep_cost per 0.5 s per lane still to go
+    prep_cost: float = 0.02
+    prep_far: float = 1000.0      # cautious driver (aggr = 0)
+    prep_near: float = 200.0      # aggressive driver (aggr = 1)
 
 
 @dataclass

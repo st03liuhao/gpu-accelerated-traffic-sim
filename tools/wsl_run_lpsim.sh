@@ -33,12 +33,14 @@ NUM_GPUS=1
 EOF
 # LPSIM_DT: simulation step (default 0.1 s; the RL policy decides every 0.5 s)
 # optional IDM parameters (LPSim defaults otherwise): LPSIM_A, LPSIM_B, LPSIM_T, LPSIM_S0
-# e.g. the training env's dynamics: LPSIM_A=1.5 LPSIM_B=2.0 LPSIM_T=1.2 LPSIM_S0=6.38 (s0 + 5 m vehicle length)
+# e.g. the training env's vehicle kinematics: LPSIM_A=1.5 LPSIM_B=2.0 LPSIM_T=1.2 LPSIM_S0=1.38 (bumper-to-bumper jam distance; vehicle lengths are modelled)
 for kv in "a:${LPSIM_A:-}" "b:${LPSIM_B:-}" "T:${LPSIM_T:-}" "s_0:${LPSIM_S0:-}"; do
   if [ -n "${kv#*:}" ]; then echo "${kv%%:*}=${kv#*:}" >> "$RUN/command_line_options.ini"; fi
 done
 # LPSIM_RL=1: RL lane-change policy instead of LPSim's rule
+# LPSIM_RL=rule: the training env's rule baseline on the same lane-change path as RL
 if [ -n "${LPSIM_RL:-}" ]; then echo "RL_LANE_CHANGE=true" >> "$RUN/command_line_options.ini"; fi
+if [ "${LPSIM_RL:-}" = rule ]; then export LPSIM_LC_RULE=1; else unset LPSIM_LC_RULE; fi
 cd "$RUN"
 export LD_LIBRARY_PATH=/usr/include/pandana/src:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 time ./lpsim

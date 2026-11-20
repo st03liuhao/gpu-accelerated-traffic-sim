@@ -4,7 +4,7 @@
 
 This specification formalizes the proposed model structure, policy inputs and outputs, safety arbitration, reward, and Proximal Policy Optimization (PPO) training procedure for the graphics processing unit (GPU)-accelerated reinforcement learning (RL) lane-changing model. It supplements the [design and training document](./GPU-accelerated%20lane-changing%20RL%20model%20design%20and%20training.md), which remains the source for scenario coverage, implementation stages, and evaluation metrics.
 
-The equations below define a practical baseline, not simulator-validated constants. The exact state and control interfaces of LPSim (the Large-scale Parallel Simulator),, vehicle dynamics, and supported lane-change behavior must be confirmed before implementation. Thresholds, scales, and bounds identified as parameters must be calibrated against those dynamics.
+The equations below define a practical baseline, not simulator-validated constants. The exact state and control interfaces of LPSim (the Large-scale Parallel Simulator), vehicle dynamics, and supported lane-change behavior must be confirmed before implementation. Thresholds, scales, and bounds identified as parameters must be calibrated against those dynamics.
 
 The model does not plan routes or trajectories. It receives lane-level route intent from the simulator and chooses lane-change and longitudinal **intent**. The simulator's car-following controller and a deterministic maneuver/safety manager determine whether and how the intent is applied.
 

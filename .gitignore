@@ -37,6 +37,7 @@ target/
 
 # Training runs, logs, and model artifacts
 runs/
+data/
 *.log
 *.pt
 *.pth

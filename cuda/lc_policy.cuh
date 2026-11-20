@@ -3,7 +3,7 @@
 // Include this header in cuda_traffic_sim.cu after generating lc_policy_weights.h with
 //   python -m lcrl.export_cuda --policy runs/<run>/policy.pt --out cuda/lc_policy_weights.h
 //
-// One thread evaluates one vehicle: ~8.5k multiply-adds, weights in __constant__ memory
+// One thread evaluates one vehicle: ~9.0k multiply-adds, weights in __constant__ memory
 // (every lane of a warp reads the same weight at the same time -> broadcast).
 #pragma once
 #include "lc_policy_weights.h"
